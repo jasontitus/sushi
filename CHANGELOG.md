@@ -37,6 +37,7 @@ earlier history is mlx-serve's, in that project's changelog.
   `/v1/messages` request with the same body would prefill, images included, without generating anything. Thanks to
   [@cosmic-quokka](https://github.com/cosmic-quokka) for the request and the patch.
 - **Opt-in cross-request token history** reuses tokenizer-matched prior turns or a frozen corpus through native MTP verification; storing prompts and outputs requires explicit `lookup_store_write: true`.
+- **DeepSeek DSpark can reuse cross-request token history** instead of running its neural drafter, with the same target verification and native fallback when history is absent or ineligible.
 
 ## v1.4.0 — DeepSeek-V4.1-Flash, Qwen STQ 2.75bpw, sushi bench
 

@@ -255,6 +255,9 @@ layers, hidden 128, ratios 0,0,2,2,2,1,1,1, 8 experts top-3, window 8, Engram at
 ORIGINAL checkpoint layout, and dumps logits, per-layer streams and sub-module captures (`fixture.safetensors`, QAT on;
 `fixture_noqat.safetensors`, off). The reference's GPU kernels are stubbed on the CPU. `DSV41_TINY=<dir>` points the Zig
 tests at the output; `zig build test` caches a passing env-gated run, so re-run the test binary to re-execute.
+The CPU oracle clamps E4M3 scales to 448 before PyTorch conversion, matching the reference's
+[saturating CUDA conversion](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/numeric_conversion.h);
+an unclamped PyTorch cast produces NaN for the overflow cases in `qat.safetensors`.
 
 `DSV41_TINY` takes the DEFAULT-geometry dump (no `--geometry`); a `--geometry stq` dump there fails `dsv41 fused: prefill ...` at `attn_2` (diff 0.39, bar 0.010). `DSV41_STQ_TINY` takes the STQ PACK built from the `--geometry stq` dump, not the dump itself.
 
@@ -268,6 +271,7 @@ tests at the output; `zig build test` caches a passing env-gated run, so re-run 
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
+| DSpark cross-request history: accepted/rejected and consecutive proposals, then native drafting | identical committed IDs, pending token and native continuation against the same-width target verifier; grammar, sampling, budget, identity, boundary and opt-out guards |
 | `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against serial decode (DSpark rows are the same at every width, and the serial step sums as the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
@@ -356,6 +360,13 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   is on and `--no-mtp` / `mtp: false` drop it. `--mtp-min-depth` / `--mtp-max-depth` bound the verify width (below); the block is fixed at 5 drafts.
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
+- **Cross-request history.** An opt-in `lookup_store` or `lookup_corpus` can supply a deterministic continuation instead of
+  running the neural drafter ([settings and privacy](engine-mtp.md#cross-request-token-history)). Misses or rejected admission
+  fall back to DSpark; `--no-mtp-lookup`, plain-policy rounds and diagnostic widths bypass history.
+  History obeys the suffix/newline gate, remaining budget and configured depth bounds, then shares DSpark's target verifier,
+  grammar masks, sampling, boundary cuts and state rollback. It does not train the neural confidence or round-cost policy.
+  Debug `[dspark-round] source=history` identifies verified proposals; `[spec-stats] mode=dspark history=R/D/A` counts their
+  rounds, drafted and accepted tokens. Tiny-fixture correctness is covered; full-checkpoint throughput is not yet measured.
 
 - <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `Generator.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
   after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the

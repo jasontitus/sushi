@@ -214,13 +214,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, help="Raw prompt already rendered with the checkpoint's chat template; default is Qwen with thinking off")
     parser.add_argument("--overlap", action="store_true", help="Cold seed96 then overlapping A192/B24 streams; B must publish before A and A must retain usable history")
-    parser.add_argument("--server-log", type=Path, help="Caller-owned dedicated server log, required with --overlap; start server with --log-level debug")
+    parser.add_argument("--dspark", action="store_true", help="Require DeepSeek DSpark history engagement with a caller-supplied prompt and debug log")
+    parser.add_argument("--server-log", type=Path, help="Caller-owned dedicated server log, required with --overlap or --dspark; start server with --log-level debug")
     args = parser.parse_args()
     url = urlsplit(args.url)
     if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost") or not url.port or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
         parser.error("use an owned plain-HTTP loopback server with an explicit port inside a coordinated GPU reservation")
     if args.overlap and (args.server_log is None or args.prompt_file is not None):
         parser.error("--overlap requires --server-log and uses its own bounded raw continuation prompts, not --prompt-file")
+    if args.dspark and (args.overlap or args.server_log is None or args.prompt_file is None):
+        parser.error("--dspark requires --server-log and --prompt-file, and cannot be combined with --overlap")
+    log_start = args.server_log.stat().st_size if args.dspark else None
     identity = hashlib.sha256((args.model_dir / "tokenizer.json").read_bytes()).digest()
     assert not snapshot(args.store, identity), "refusing a populated history store"
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -236,6 +240,8 @@ def main():
     records = []
     for name, speculative, streaming in (("serial", False, False), ("mtp", True, False), ("mtp-stream", True, True)):
         body = {"model": args.model, "prompt": prompt_ids, "max_tokens": 64, "temperature": 0, "enable_mtp": speculative, "enable_drafter": False, "stream": streaming}
+        if args.dspark:
+            body["ignore_eos"] = True
         if streaming:
             body["stream_options"] = {"include_usage": True}
         with post(args.url, "/v1/completions", body) as response:
@@ -278,6 +284,14 @@ def main():
         with post(args.url, "/detokenize", {"model": args.model, "tokens": output}) as response:
             assert json.load(response)["content"] == record["text"], "durable output differs from engine response"
     summary = {"documents": len(documents), "requests": [{key: value for key, value in record.items() if key != "text"} for record in records], "serial_matches_mtp": records[0]["text"] == records[1]["text"], "scope": "publication/stream parity, not universal variable-width serial equivalence, throughput or proof of draft-source engagement"}
+    if args.dspark:
+        with args.server_log.open("rb") as log:
+            log.seek(log_start)
+            observed = log.read().decode(errors="replace")
+        summary["history_rounds"] = len(re.findall(r"\[dspark-round\] source=history\b", observed))
+        assert summary["history_rounds"] > 0, "UNEXERCISED: no DSpark history proposal was verified"
+        assert "[spec-stats] mode=dspark" in observed, "DSpark did not serve the requests"
+        summary["scope"] = "DSpark history engagement, exact terminal publication and stream parity; not throughput or model quality"
     (args.output / "history-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print("PASS: exact private history documents and greedy MTP stream/non-stream publication" if expected else "SKIP: no emitted tokens to exercise persistence")
 

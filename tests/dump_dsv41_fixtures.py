@@ -115,7 +115,8 @@ class Kernel(types.ModuleType):
         amax = z.abs().amax(-1, keepdim=True)
         if scale_dtype == torch.float8_e4m3fn:
             amax = amax.clamp_min(6 * 2.0 ** -9)
-            s = (amax / 6).to(torch.float8_e4m3fn).float()
+            # TileLang's CUDA E4M3 cast saturates; PyTorch's cast alone produces NaN on overflow.
+            s = (amax / 6).clamp_max(E4M3_MAX).to(torch.float8_e4m3fn).float()
         else:
             amax = amax.clamp_min(6 * 2.0 ** -126)
             s = self._round_scale(amax * INV_E2M1_MAX)

@@ -2317,6 +2317,7 @@ pub const Generator = struct {
                 },
             );
             if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
+            if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] mode=dspark history={d}/{d}/{d} rounds/drafted/accepted\n", .{ self.mtp_lookup_rounds, self.mtp_lookup_drafted, self.mtp_lookup_accepted });
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
@@ -4573,6 +4574,31 @@ pub const Generator = struct {
         return .{ .tokens = tokens, .accepted_tokens = @intCast(round.accepted_drafts) };
     }
 
+    fn dsparkHistoryMatch(self: *Generator, allocator: std.mem.Allocator, t1: u32) !?mtp_lookup.Match {
+        if (mtp_lookup_disabled or !self.xfm.history_config.enabled() or self.external_history_failed) return null;
+        const policy = &self.dspark_policy;
+        const cap = @min(policy.range.max_rows - 1, @min(dsv41_max_verify_rows - 1, mtp_lookup.MAX_DRAFT_STRONG));
+        const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
+        if (cap == 0 or remaining == 0) return null;
+        var tail: [@import("token_history.zig").max_order - 1]u32 = undefined;
+        const generated = self.generated_ids.items;
+        const ng = @min(generated.len, tail.len);
+        const np = @min(self.prompt_ids_owned.len, tail.len - ng);
+        @memcpy(tail[0..np], self.prompt_ids_owned[self.prompt_ids_owned.len - np ..]);
+        @memcpy(tail[np..][0..ng], generated[generated.len - ng ..]);
+        var got = (try self.externalLookupMatch(allocator, tail[0 .. np + ng], t1, cap)) orelse return null;
+        const width = std.math.clamp(self.mtp_round_drafted_ema, 1, @as(f32, @floatFromInt(cap)));
+        var costs = mtp_lookup.Costs{
+            .mtp = policy.cost.draft_ms + policy.cost.plain_ms + policy.cost.step_ms * width,
+            .lookup = undefined,
+        };
+        for (&costs.lookup, 0..) |*cost, k| cost.* = policy.cost.plain_ms + policy.cost.step_ms * @as(f32, @floatFromInt(k));
+        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+        if (k == 0 or k < policy.range.min_rows - 1) return null;
+        got.draft = got.draft[0..k];
+        return got;
+    }
+
     /// One DSpark round (deepseek_v41, greedy): the stages draft a block from the pending token, a verify chunk
     /// `[t1, drafts]` reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with
     /// stays, with the trunk's token after it pending. The model cuts its state back to the kept rows.
@@ -4615,7 +4641,12 @@ pub const Generator = struct {
         var block: ?@import("dsv41_model.zig").Draft = null;
         defer if (block) |*b| b.deinit();
         var block_len: usize = 1;
-        if (forced == null or forced.? > 1) {
+        const history = if (forced == null) try self.dsparkHistoryMatch(allocator, t1) else null;
+        if (history) |proposal| {
+            ids_buf[0] = t1;
+            @memcpy(ids_buf[1..][0..proposal.draft.len], proposal.draft);
+            block_len += proposal.draft.len;
+        } else if (forced == null or forced.? > 1) {
             block = try xfm.dsv41Draft(t1);
             block_len = block.?.ids.len;
             @memcpy(ids_buf[0..block_len], block.?.ids);
@@ -4627,7 +4658,7 @@ pub const Generator = struct {
             ids_buf[i] = ids_buf[block_len - 1];
         };
         // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
-        const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
+        const wanted: usize = forced orelse if (history != null) block_len else policy.rows(conf_buf[0 .. block_len - 1]);
         var rows: usize = rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at);
         // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
         // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
@@ -4693,7 +4724,20 @@ pub const Generator = struct {
         st.accepted += accepted;
         st.draft_ns += draft_ns;
         st.verify_ns += verify_ns;
-        if (diag == .off or diag == .log) {
+        if (history != null) {
+            self.mtp_lookup_rounds += 1;
+            self.mtp_lookup_drafted += rows - 1;
+            self.mtp_lookup_accepted += accepted;
+            self.mtp_lookup_streak = accepted == rows - 1;
+            self.mtp_lookup_ema = mtp_lookup.emaStep(self.mtp_lookup_ema, accepted);
+            log.debug("  [dspark-round] source=history ctx={d} rows={d} accepted={d}\n", .{ ctx_before, rows, accepted });
+        } else if (block != null) {
+            self.mtp_round_ema = mtp_lookup.emaStep(self.mtp_round_ema, accepted);
+            self.mtp_round_drafted_ema = mtp_lookup.emaStep(self.mtp_round_drafted_ema, @intCast(rows - 1));
+            self.mtp_lookup_ema = mtp_lookup.driftStep(self.mtp_lookup_ema);
+        }
+        // History has no neural confidence or draft-cost sample.
+        if (history == null and (diag == .off or diag == .log)) {
             const ms = struct {
                 fn of(ns: u64) f32 {
                     return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);
@@ -5690,8 +5734,8 @@ pub const Generator = struct {
         return &self.mtp_lookup_idx.?;
     }
 
-    /// External tiers are queried only after native lookup admission. The
-    /// returned proposal borrows request scratch, never a verifier flight.
+    /// Queries leased external tiers; the result borrows request scratch,
+    /// never a verifier flight.
     pub fn externalLookupMatch(self: *Generator, allocator: std.mem.Allocator, committed: []const u32, t1: u32, cap: u32) !?mtp_lookup.Match {
         if (!self.xfm.history_config.enabled() or self.external_history_failed) return null;
         if (self.external_history == null) {
@@ -20945,6 +20989,207 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
         n += r.tokens.len;
     }
     try testing.expectEqual(@as(usize, want), n);
+}
+
+test "dsv41 history: accepted and rejected proposals preserve the next native round (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dsv41_model = @import("dsv41_model.zig");
+    const history = @import("token_history.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const saved_bounds = depth_bounds.active;
+    const saved_lookup = mtp_lookup_disabled;
+    defer depth_bounds.active = saved_bounds;
+    defer mtp_lookup_disabled = saved_lookup;
+    depth_bounds.active = .{ .min = 4, .max = 4 };
+    mtp_lookup_disabled = false;
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    dsv41_model.setDsparkExact(xfm.dsv41.?, true);
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    tok.content_sha256 = @splat(0x5a);
+    try tok.id_to_token.put(xfm.dsv41.?.cfg.vocab - 1, "token");
+    const prompt = ids[0..40];
+    const want: u32 = 30;
+    const greedy = SamplingParams{ .temperature = 0 };
+    var reference: std.ArrayList(u32) = .empty;
+    defer reference.deinit(a);
+    {
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = 1 };
+        while (try gen.nextDspark(a)) |round| {
+            defer a.free(round.tokens);
+            try reference.appendSlice(a, round.tokens);
+        }
+    }
+    try testing.expectEqual(want, reference.items.len);
+    for ([_]u32{ 0, 2, 4 }) |accepted| {
+        const lookup_rounds: u32 = if (accepted == 4) 3 else 1;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        const recorded = try a.dupe(u32, reference.items);
+        defer a.free(recorded);
+        if (accepted < 4) recorded[accepted + 1] = (recorded[accepted + 1] + 1) % xfm.dsv41.?.cfg.vocab;
+        var expected: std.ArrayList(u32) = .empty;
+        defer expected.deinit(a);
+        var expected_pending: u32 = undefined;
+        // FP8/FP4 rows can round by width; compare the same verify block after a discarded neural draft.
+        try xfm.resetCache();
+        {
+            var manual = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+            defer manual.deinit(a);
+            for (0..lookup_rounds) |_| {
+                const offset = manual.generated_ids.items.len;
+                const proposal = recorded[offset..][0..5];
+                try testing.expectEqual(manual.next_token_id, proposal[0]);
+                var discarded = try xfm.dsv41Draft(manual.next_token_id);
+                defer discarded.deinit();
+                const logits = try xfm.dsv41Verify(&manual.ctx, proposal);
+                defer _ = mlx.mlx_array_free(logits);
+                var verdict = try verifyArgmax(logits, null, xfm.s);
+                defer verdict.deinit();
+                try mlx.check(mlx.mlx_array_eval(verdict.lazy()));
+                const best = try verdict.ids(5);
+                var kept: u32 = 0;
+                while (kept < 4 and @as(u32, @intCast(best[kept])) == proposal[kept + 1]) kept += 1;
+                try testing.expectEqual(accepted, kept);
+                expected_pending = @intCast(best[kept]);
+                try xfm.dsv41Finish(&manual.ctx, kept);
+                try manual.generated_ids.appendSlice(a, proposal[0 .. kept + 1]);
+                manual.advanceStep(kept + 1);
+                manual.next_token_id = expected_pending;
+            }
+            while (try manual.nextDspark(a)) |round| a.free(round.tokens);
+            try expected.appendSlice(a, manual.generated_ids.items);
+        }
+        try history.appendFinalTurn(io, a, path, tok.content_sha256.?, prompt, recorded);
+        try xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        xfm.history_config = .{ .lookup_store = path };
+        defer xfm.history_config = .{};
+        const policy_before = gen.dspark_policy;
+        for (0..lookup_rounds) |round_index| {
+            const offset = gen.generated_ids.items.len;
+            const round = (try gen.nextDspark(a)).?;
+            defer a.free(round.tokens);
+            try testing.expectEqual(round_index + 1, gen.mtp_lookup_rounds);
+            try testing.expectEqual(accepted, round.accepted_tokens);
+            try testing.expectEqualSlices(u32, reference.items[offset..][0 .. 1 + accepted], round.tokens);
+            try testing.expectEqualDeep(policy_before, gen.dspark_policy);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, xfm.dsv41.?.dec_state.?.n);
+            try testing.expect(xfm.dsv41.?.dec_state.?.verify == null);
+        }
+        try testing.expectEqual(expected_pending, gen.next_token_id);
+        xfm.history_config = .{};
+        while (try gen.nextDspark(a)) |round| a.free(round.tokens);
+        try testing.expect(gen.dspark_stats.rounds > gen.mtp_lookup_rounds);
+        try testing.expectEqual(lookup_rounds, gen.mtp_lookup_rounds);
+        try testing.expectEqualSlices(u32, expected.items, gen.generated_ids.items);
+        try testing.expectEqualStrings("length", gen.finish_reason);
+    }
+    var grammar_bytes = try grammarTestBytes(a, xfm.dsv41.?.cfg.vocab, xfm.dsv41.?.cfg.vocab - 1, 1);
+    defer grammar_bytes.deinit();
+    var schema = try std.json.parseFromSlice(std.json.Value, a, grammar_test_schema, .{});
+    defer schema.deinit();
+    const Guard = enum { disabled, miss, identity, budget, floor, image, boundary, context, diagnostic, adaptive, sampled_reject, grammar };
+    for (std.meta.tags(Guard)) |guard| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        var recorded: [5]u32 = undefined;
+        @memcpy(&recorded, reference.items[0..5]);
+        if (guard == .sampled_reject) recorded[1] = (recorded[1] + 1) % xfm.dsv41.?.cfg.vocab;
+        var stored_prompt: [40]u32 = undefined;
+        @memcpy(&stored_prompt, prompt);
+        if (guard == .miss) stored_prompt[39] = (stored_prompt[39] + 1) % xfm.dsv41.?.cfg.vocab;
+        try xfm.resetCache();
+        const limit: u32 = switch (guard) {
+            .budget => 1,
+            .floor => 3,
+            else => want,
+        };
+        var sampling: SamplingParams = if (guard == .sampled_reject) .{ .temperature = 0.8, .top_k = 1, .seed = 7 } else greedy;
+        var constraint: SchemaConstraint = undefined;
+        if (guard == .grammar) {
+            try constraint.initFromValue(a, schema.value, &grammar_bytes);
+            constraint.constraint.row_masks = true;
+            sampling.constraint = &constraint.constraint;
+        }
+        defer if (guard == .grammar) constraint.deinit();
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, limit, sampling, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        if (guard == .grammar) {
+            try gen.dsparkSamplePending(a, &constraint.constraint);
+            recorded[0] = gen.next_token_id;
+            recorded[1] = 0; // Pad has no grammar bytes and must never enter the verify tail.
+        }
+        try history.appendFinalTurn(io, a, path, tok.content_sha256.?, &stored_prompt, &recorded);
+        xfm.history_config = .{ .lookup_store = path };
+        defer xfm.history_config = .{};
+        const image_id = xfm.dsv41.?.cfg.image_token_id;
+        const max_ctx = max_mtp_ctx;
+        defer xfm.dsv41.?.cfg.image_token_id = image_id;
+        defer max_mtp_ctx = max_ctx;
+        defer mtp_lookup_disabled = false;
+        defer tok.content_sha256 = @splat(0x5a);
+        switch (guard) {
+            .disabled => mtp_lookup_disabled = true,
+            .identity => tok.content_sha256 = @splat(0x5b),
+            .image => xfm.dsv41.?.cfg.image_token_id = recorded[1],
+            .boundary => gen.dspark_round_ends_at = recorded[2],
+            .context => max_mtp_ctx = @intCast(prompt.len - 1),
+            .diagnostic => gen.dspark_diag = .{ .rows = 1 },
+            .adaptive => {
+                gen.dspark_policy = dspark_rows.Policy.init(.{}, 4);
+                gen.dspark_policy.cost.step_ms = 15;
+            },
+            else => {},
+        }
+        var policy_expected = gen.dspark_policy;
+        _ = policy_expected.next();
+        const round = (try gen.nextDspark(a)).?;
+        defer a.free(round.tokens);
+        const engaged = guard == .image or guard == .boundary or guard == .adaptive or guard == .sampled_reject or guard == .grammar;
+        try testing.expectEqual(@as(u64, @intFromBool(engaged)), gen.mtp_lookup_rounds);
+        try testing.expectEqual(gen.ctx.cache.step, xfm.dsv41.?.dec_state.?.n);
+        try testing.expect(xfm.dsv41.?.dec_state.?.verify == null);
+        if (engaged) try testing.expectEqualDeep(policy_expected, gen.dspark_policy);
+        switch (guard) {
+            .budget, .context, .diagnostic, .image, .sampled_reject => try testing.expectEqual(@as(usize, 1), round.tokens.len),
+            .floor => try testing.expect(gen.completion_tokens <= 3),
+            .boundary => try testing.expect(gen.mtp_lookup_drafted <= 2),
+            .identity => try testing.expect(gen.external_history_failed),
+            .disabled => try testing.expect(gen.external_history == null),
+            .adaptive => try testing.expectEqual(@as(u64, 4), gen.mtp_lookup_drafted),
+            .miss => try testing.expect(!gen.external_history_failed),
+            .grammar => {
+                try testing.expectEqual(@as(usize, 1), round.tokens.len);
+                try testing.expectEqualStrings("{", grammar_bytes.bytes[round.tokens[0]].?);
+            },
+        }
+    }
 }
 
 test "dsv41 generator: a DSpark round ends right behind the id it is told to, at any verify width, with the state standing there (DSV41_TINY)" {
