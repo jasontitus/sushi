@@ -1302,6 +1302,7 @@ pub const Generator = struct {
                 },
             );
             if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
+            if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] mode=dspark history={d}/{d}/{d} rounds/drafted/accepted\n", .{ self.mtp_lookup_rounds, self.mtp_lookup_drafted, self.mtp_lookup_accepted });
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());

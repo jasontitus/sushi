@@ -175,9 +175,11 @@ Stored IDs are reversible sensitive prompt/output content. Use separate paths pe
 per tokenizer: matching identity is not access control. Writable stores use owner-only directories/files
 (`0700`/`0600` on POSIX), not encryption or secure deletion.
 
-- Native local lookup admission runs first; an admitted native continuation remains the incumbent. External
+- Qwen/MiMo native local lookup admission runs first; an admitted native continuation remains the incumbent. External
   proposals use the same suffix/newline gate, depth floor, draft cap and exact MTP target verifier. Planner-owned,
   batched-head and otherwise ineligible rounds stay ineligible; DFlash/GLM proposal routing is unchanged.
+- DeepSeek's [DSpark path](dsv41-arch.md#dspark) can use external history instead of its neural draft, with the same
+  target verification and state commit; a miss falls back to DSpark without adding local prompt-lookup routing.
 - Existing debug `[mtp-round]` lines identify `source=local|history|mtp` alongside drafted tokens and accepted
   drafts, so verified external engagement can be distinguished from configuration or local lookup.
 - Newline evidence excludes the pending anchor; only strong suffixes may exceed the ordinary draft cap.

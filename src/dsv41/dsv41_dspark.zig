@@ -4,6 +4,7 @@ const generate_mod = @import("../generate.zig");
 const io_util = @import("../io_util.zig");
 const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
+const mtp_lookup = @import("../mtp_lookup.zig");
 const mtp_mod = @import("../mtp.zig");
 const mtp_plan = @import("../mtp_plan.zig");
 const row_grammar = @import("../row_grammar.zig");
@@ -70,6 +71,31 @@ pub fn dsparkEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
     return !mtp_plan.mtpUnsupported(sampling, logprobs_n);
 }
 
+fn dsparkHistoryMatch(self: *Generator, allocator: std.mem.Allocator, t1: u32) !?mtp_lookup.Match {
+    if (generate_mod.mtp_lookup_disabled or !self.xfm.history_config.enabled() or self.external_history_failed) return null;
+    const policy = &self.dspark_policy;
+    const cap = @min(policy.range.max_rows - 1, @min(dsv41_max_verify_rows - 1, mtp_lookup.MAX_DRAFT_STRONG));
+    const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
+    if (cap == 0 or remaining == 0) return null;
+    var tail: [@import("../token_history.zig").max_order - 1]u32 = undefined;
+    const generated = self.generated_ids.items;
+    const ng = @min(generated.len, tail.len);
+    const np = @min(self.prompt_ids_owned.len, tail.len - ng);
+    @memcpy(tail[0..np], self.prompt_ids_owned[self.prompt_ids_owned.len - np ..]);
+    @memcpy(tail[np..][0..ng], generated[generated.len - ng ..]);
+    var got = (try self.externalLookupMatch(allocator, tail[0 .. np + ng], t1, cap)) orelse return null;
+    const width = std.math.clamp(self.mtp_round_drafted_ema, 1, @as(f32, @floatFromInt(cap)));
+    var costs = mtp_lookup.Costs{
+        .mtp = policy.cost.draft_ms + policy.cost.plain_ms + policy.cost.step_ms * width,
+        .lookup = undefined,
+    };
+    for (&costs.lookup, 0..) |*cost, k| cost.* = policy.cost.plain_ms + policy.cost.step_ms * @as(f32, @floatFromInt(k));
+    const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+    if (k == 0 or k < policy.range.min_rows - 1) return null;
+    got.draft = got.draft[0..k];
+    return got;
+}
+
 /// One DSpark round (deepseek_v41, greedy): the stages draft a block from the pending token, a verify chunk
 /// `[t1, drafts]` reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with
 /// stays, with the trunk's token after it pending. The model cuts its state back to the kept rows.
@@ -117,7 +143,12 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     var block: ?@import("dsv41_model.zig").Draft = null;
     defer if (block) |*b| b.deinit();
     var block_len: usize = 1;
-    if (forced == null or forced.? > 1) {
+    const history = if (forced == null) try dsparkHistoryMatch(self, allocator, t1) else null;
+    if (history) |proposal| {
+        ids_buf[0] = t1;
+        @memcpy(ids_buf[1..][0..proposal.draft.len], proposal.draft);
+        block_len += proposal.draft.len;
+    } else if (forced == null or forced.? > 1) {
         block = try xfm.dsv41Draft(t1);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
@@ -129,7 +160,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         ids_buf[i] = ids_buf[block_len - 1];
     };
     // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
-    const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
+    const wanted: usize = forced orelse if (history != null) block_len else policy.rows(conf_buf[0 .. block_len - 1]);
     var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
     // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
     // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
@@ -195,7 +226,20 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     st.accepted += accepted;
     st.draft_ns += draft_ns;
     st.verify_ns += verify_ns;
-    if (diag == .off or diag == .log) {
+    if (history != null) {
+        self.mtp_lookup_rounds += 1;
+        self.mtp_lookup_drafted += rows - 1;
+        self.mtp_lookup_accepted += accepted;
+        self.mtp_lookup_streak = accepted == rows - 1;
+        self.mtp_lookup_ema = mtp_lookup.emaStep(self.mtp_lookup_ema, accepted);
+        log.debug("  [dspark-round] source=history ctx={d} rows={d} accepted={d}\n", .{ ctx_before, rows, accepted });
+    } else if (block != null) {
+        self.mtp_round_ema = mtp_lookup.emaStep(self.mtp_round_ema, accepted);
+        self.mtp_round_drafted_ema = mtp_lookup.emaStep(self.mtp_round_drafted_ema, @intCast(rows - 1));
+        self.mtp_lookup_ema = mtp_lookup.driftStep(self.mtp_lookup_ema);
+    }
+    // History has no neural confidence or draft-cost sample.
+    if (history == null and (diag == .off or diag == .log)) {
         const ms = struct {
             fn of(ns: u64) f32 {
                 return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);

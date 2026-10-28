@@ -270,8 +270,8 @@ pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_look
     return &self.mtp_lookup_idx.?;
 }
 
-/// External tiers are queried only after native lookup admission. The
-/// returned proposal borrows request scratch, never a verifier flight.
+/// Queries leased external tiers; the result borrows request scratch,
+/// never a verifier flight.
 pub fn externalLookupMatch(self: *Generator, allocator: std.mem.Allocator, committed: []const u32, t1: u32, cap: u32) !?mtp_lookup.Match {
     if (!self.xfm.history_config.enabled() or self.external_history_failed) return null;
     if (self.external_history == null) {
