@@ -270,6 +270,33 @@ pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_look
     return &self.mtp_lookup_idx.?;
 }
 
+/// External tiers are queried only after native lookup admission. The
+/// returned proposal borrows request scratch, never a verifier flight.
+pub fn externalLookupMatch(self: *Generator, allocator: std.mem.Allocator, committed: []const u32, t1: u32, cap: u32) !?mtp_lookup.Match {
+    if (!self.xfm.history_config.enabled() or self.external_history_failed) return null;
+    if (self.external_history == null) {
+        if (self.xfm.token_history == null) self.xfm.token_history = @import("token_history.zig").HistoryCache.init(self.xfm.allocator);
+        const request = allocator.create(@import("history.zig").Request) catch |err| {
+            self.external_history_failed = true;
+            log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+            return null;
+        };
+        request.* = @import("history.zig").Request.init(self.timer.io, allocator, &self.xfm.token_history.?, self.xfm.history_config, self.tok.content_sha256, @intCast(self.tok.definedVocabSize())) catch |err| {
+            self.external_history_failed = true;
+            allocator.destroy(request);
+            log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+            return null;
+        };
+        @import("token_history.zig").retainBytes(@sizeOf(@import("history.zig").Request));
+        self.external_history = request;
+    }
+    return self.external_history.?.match(committed, t1, cap, LookupLines{ .tok = self.tok }) catch |err| {
+        self.external_history_failed = true;
+        log.warn("[history] proposal tier refused: {s}\n", .{@errorName(err)});
+        return null;
+    };
+}
+
 /// A chain of the context's continuation after `t1`, or null when the gate
 /// prefers the MTP head.
 pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
@@ -277,17 +304,23 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     const idx = try self.mtpLookupIndex(allocator);
     const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
     const lookup_cap = depth_bounds.lookupCap(mtpLookupDraftCap(self.xfm.config.isMimo()), depth_bounds.active);
-    const got = idx.match(t1, lookup_cap);
+    var got = idx.match(t1, lookup_cap);
     const kv = self.mtpKvLen();
     const src = MtpCostSource.init(self.mtp_ev_costs, kv, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
-    const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, mtpLookupCostsFor(src, mtpLookupPriceWidth(plan, self.mtp_round_drafted_ema)));
+    const costs = mtpLookupCostsFor(src, mtpLookupPriceWidth(plan, self.mtp_round_drafted_ema));
+    var k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+    const floor = depth_bounds.floorFor(depth_bounds.active, lookup_cap);
+    if (k == 0 or k < floor) {
+        got = try self.externalLookupMatch(allocator, idx.toks.items, t1, lookup_cap);
+        k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, costs);
+    }
     if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
     const Once = struct {
         var logged = false;
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.?.suffix });
+        log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d} source={s}\n", .{ k, got.?.suffix, @tagName(got.?.source) });
     }
     // No MTP chain consumes the stash this round; left pending, it would grow
     // across lookup rounds into one oversized head forward.
@@ -323,6 +356,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
         .h_chain = null,
         .m = k,
         .lookup = true,
+        .lookup_source = got.?.source,
     };
 }
 
@@ -2180,7 +2214,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.mtp_trace.add(.eval, ph.read());
         ph.reset();
     }
-    log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted });
+    log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d} source={s}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted, if (chain.lookup) @tagName(chain.lookup_source) else "mtp" });
 
     // ── Phase 5a: stash the committed history for a DEFERRED append ──
     // The old shape paid a second head forward (appendHistory) here every
@@ -2522,6 +2556,7 @@ pub const MtpPreDraft = struct {
     /// Drafts are a context continuation (`mtpLookupChain`): nothing to
     /// build, and no MTP statistics are fed.
     lookup: bool = false,
+    lookup_source: mtp_lookup.Source = .local,
 
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.t1_arr);

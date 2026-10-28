@@ -824,6 +824,8 @@ pub const StreamingTokenStream = struct {
     pending_buf: std.ArrayList(u32) = .empty,
     pending_idx: usize = 0,
     finished: bool = false,
+    history_ledger: @import("history_publication.zig").Ledger = .{},
+    history_failed: bool = false,
 
     /// Stats populated by `finalize()` after the stream ends. Consumers read
     /// these instead of touching the underlying gen/slot directly so the same
@@ -856,6 +858,7 @@ pub const StreamingTokenStream = struct {
     }
 
     pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
+        self.finalize();
         self.pending_buf.deinit(allocator);
     }
 
@@ -875,6 +878,12 @@ pub const StreamingTokenStream = struct {
             self.prompt_tokens = g.prompt_tokens;
             self.completion_tokens = g.completion_tokens;
             self.finish_reason = g.finish_reason;
+            const outcome: @import("history_publication.zig").Outcome = if (self.history_failed) .failed else if (self.finished) .completed else .cancelled;
+            const output = self.history_ledger.finish(g.generated_ids.items, outcome) catch |err| {
+                log.warn("[history] stream publication refused: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (output) |ids| generate_mod.publishHistoryTurn(g.timer.io, g.xfm, g.tok, g.prompt_ids_owned, ids);
         }
     }
 
@@ -904,6 +913,17 @@ pub const StreamingTokenStream = struct {
     /// Yield the next decoded token id, or null if generation is complete.
     /// Mirrors the contract of `Generator.next` for the regular path.
     fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
+        const token = self.nextUnpublished(allocator) catch |err| {
+            self.history_failed = true;
+            return err;
+        };
+        if (self.gen) |gen| {
+            if (token) |id| self.history_ledger.emitted(id, gen.generated_ids.items) else self.finished = true;
+        }
+        return token;
+    }
+
+    fn nextUnpublished(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
         // Scheduler path: drain the slot's output ring one token at a time.
         // The inference thread already handled regular/drafter/MTP dispatch
         // via runSingleDecodeTick; we just consume what it pushed.
@@ -1007,6 +1027,23 @@ pub const StreamingTokenStream = struct {
         }
     }
 };
+
+test "history legacy stream publishes drained tokens not its pending verified tail" {
+    var verified = [_]u32{ 41, 42, 43, 44 };
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.generated_ids.items = &verified;
+    var stream = StreamingTokenStream{
+        .gen = &gen,
+        .mode = .mtp,
+        .eos_token_ids = &.{},
+        .pending_buf = .empty,
+    };
+    stream.pending_buf.items = &verified;
+    try std.testing.expectEqual(@as(?u32, 41), try stream.next(std.testing.allocator));
+    try std.testing.expectEqual(@as(?u32, 42), try stream.next(std.testing.allocator));
+    try std.testing.expectEqualSlices(u32, &.{ 41, 42 }, (try stream.history_ledger.finish(&verified, .cancelled)).?);
+}
 
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 
@@ -2513,6 +2550,8 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     slot.logprobs_buf = .empty;
     slot.out_idx = 0;
     slot.handover_token = null;
+    slot.legacy_gen = null;
+    slot.history_publication = .{};
     slot.cancelled = .init(false);
     slot.finished = false;
     slot.error_code = null;

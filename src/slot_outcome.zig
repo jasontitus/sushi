@@ -244,6 +244,19 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+pub fn publishHistory(slot: *Slot, outcome: @import("history_publication.zig").Outcome) void {
+    if (slot.history_publication.finalized) return;
+    const generated = if (slot.legacy_gen) |*g| g.generated_ids.items else &.{};
+    const output = slot.history_publication.finish(generated, outcome) catch |err| {
+        log.warn("[history] publication refused: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const ids = output orelse return;
+    const xfm = slot.model.transformer orelse return;
+    const tok = slot.model.tokenizer orelse return;
+    generate_mod.publishHistoryTurn(slot.io, xfm, tok, slot.full_prompt, ids);
+}
+
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -260,6 +273,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
+    publishHistory(slot, if (latched != null or slot.error_code != null) .failed else if (std.mem.eql(u8, reason, "cancelled")) .cancelled else .completed);
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     if (latched == null) logStop(slot, reason);
     commitSlotIfApplicable(sch, slot);
@@ -305,6 +319,40 @@ fn logDiskUsage(model: *const LoadedModel) void {
     if (snap.budget == 0) return;
     var buf: [128]u8 = undefined;
     log.info("{s}\n", .{disk_placement.diskUsageLine(&buf, snap.used, snap.budget, snap.entries)});
+}
+
+test "history failed terminal attempt never publishes on a later completion" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const path = try std.fmt.allocPrint(a, "{s}/history", .{root});
+    defer a.free(path);
+    var tok = @import("tokenizer.zig").Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    tok.content_sha256 = @splat(9);
+    var xfm: @import("transformer.zig").Transformer = undefined;
+    xfm.allocator = a;
+    xfm.token_history = null;
+    xfm.history_config = .{ .lookup_store = path, .lookup_store_write = true };
+    defer if (xfm.token_history) |*cache| cache.deinit() catch unreachable;
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    model.tokenizer = &tok;
+    var slot: Slot = undefined;
+    slot.io = io;
+    slot.model = &model;
+    slot.legacy_gen = null;
+    var prompt = [_]u32{ 1, 2 };
+    slot.full_prompt = &prompt;
+    slot.history_publication = .{};
+    slot.history_publication.emitted(77, &.{});
+    publishHistory(&slot, .failed);
+    publishHistory(&slot, .completed);
+    try testing.expect(slot.history_publication.finalized);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "history", .{}));
 }
 
 test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {

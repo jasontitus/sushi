@@ -192,6 +192,9 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
+    config.lookup_store_override = o.lookup_store;
+    config.lookup_corpus_override = o.lookup_corpus;
+    config.lookup_store_write_override = o.lookup_store_write orelse false;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -298,6 +301,26 @@ const LaunchGlobals = struct {
         generate_mod.mtp_greedy_tail_explicit = self.greedy_tail_explicit;
     }
 };
+
+test "history settings follow the copied model config and bind at the final transformer address" {
+    const FilePath = @import("logit_bias.zig").FilePath;
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
+    applyModelSettings(&config, .{
+        .lookup_store = FilePath.from("/history/store"),
+        .lookup_corpus = FilePath.from("/history/corpus"),
+        .lookup_store_write = true,
+    });
+    var xfm: Transformer = undefined;
+    xfm.config = config;
+    applyModelSettings(&config, .{});
+    xfm.configureHistory();
+    try testing.expectEqualStrings("/history/store", xfm.history_config.lookup_store.?);
+    try testing.expectEqualStrings("/history/corpus", xfm.history_config.lookup_corpus.?);
+    try testing.expect(xfm.history_config.lookup_store_write);
+    try testing.expect(config.lookup_store_override == null);
+    try testing.expect(config.lookup_corpus_override == null);
+    try testing.expect(!config.lookup_store_write_override);
+}
 
 test "an explicit launch flag outranks model-settings.json for MTP, acceptance, greedy tail and KV" {
     const saved = LaunchGlobals.save();
@@ -1654,6 +1677,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.configureHistory();
     errdefer xfm_ptr.deinit();
     if (xfm_ptr.expert_stream) |engine| {
         engine.borrow_publish = &params.config.expert_borrow_bytes;
