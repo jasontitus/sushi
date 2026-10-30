@@ -3528,7 +3528,7 @@ fn checkHistoryPrefixBudget(ssd_first: bool) !void {
         .chunk_explicit = generate_mod.prefill_chunk_explicit,
         .chunk = generate_mod.prefill_chunk_override,
         .per_request = per_request_chunk_override,
-        .qsa_fused = transformer_mod.qsa_score_fused_override,
+        .qsa_fused = qwen4_qsa_select.qsa_score_fused_override,
     };
     defer {
         static_ceiling_override = saved.ceiling;
@@ -3544,7 +3544,7 @@ fn checkHistoryPrefixBudget(ssd_first: bool) !void {
         generate_mod.prefill_chunk_explicit = saved.chunk_explicit;
         generate_mod.prefill_chunk_override = saved.chunk;
         per_request_chunk_override = saved.per_request;
-        transformer_mod.qsa_score_fused_override = saved.qsa_fused;
+        qwen4_qsa_select.qsa_score_fused_override = saved.qsa_fused;
     }
     const gib: u64 = 1 << 30;
     const ceiling: u64 = 64 * gib;
@@ -3563,7 +3563,7 @@ fn checkHistoryPrefixBudget(ssd_first: bool) !void {
     generate_mod.prefill_chunk_explicit = false;
     generate_mod.prefill_chunk_override = 8192;
     per_request_chunk_override = true;
-    transformer_mod.qsa_score_fused_override = false;
+    qwen4_qsa_select.qsa_score_fused_override = false;
     var cfg = qwen4DeployedTestConfig();
     cfg.mtp_override = false;
     cfg.pinned_context = 8192;
