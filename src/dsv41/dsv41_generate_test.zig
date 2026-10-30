@@ -328,7 +328,8 @@ test "dsv41 history: accepted and rejected proposals preserve the next native ro
     {
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = 1 };
+        // The source fixture is not width-invariant; its reference uses the history verifier's five rows.
+        gen.dspark_diag = .{ .rows = 5 };
         while (try gen.nextDspark(a)) |round| {
             defer a.free(round.tokens);
             try reference.appendSlice(a, round.tokens);

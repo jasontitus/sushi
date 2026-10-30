@@ -287,7 +287,7 @@ an unclamped PyTorch cast produces NaN for the overflow cases in `qat.safetensor
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
-| DSpark cross-request history: accepted/rejected and consecutive proposals, then native drafting | identical committed IDs, pending token and native continuation against the same-width target verifier; grammar, sampling, budget, identity, boundary and opt-out guards |
+| DSpark cross-request history: accepted/rejected and consecutive proposals, then native drafting | identical committed IDs, pending token and native continuation against the same-width target verifier (including the source fixture's reference generation); grammar, sampling, budget, identity, boundary and opt-out guards |
 | `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against serial decode (DSpark rows are the same at every width, and the serial step sums as the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
