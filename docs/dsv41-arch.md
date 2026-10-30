@@ -384,7 +384,8 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   History obeys the suffix/newline gate, remaining budget and configured depth bounds, then shares DSpark's target verifier,
   grammar masks, sampling, boundary cuts and state rollback. It does not train the neural confidence or round-cost policy.
   Debug `[dspark-round] source=history` identifies verified proposals; `[spec-stats] mode=dspark history=R/D/A` counts their
-  rounds, drafted and accepted tokens. Tiny-fixture correctness is covered; full-checkpoint throughput is not yet measured.
+  rounds, drafted and accepted tokens. Tiny-fixture correctness and a [full-checkpoint replay](#history-replay) are covered;
+  the replay establishes engagement and output parity, not a timing-qualified speedup.
 
 - <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `Generator.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
   after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the
@@ -806,3 +807,35 @@ The f16 attention arm's KLD run (the kernel is in, `Model.attn_f16` off); the li
   then a CED chunk of 256 rows and a 42-row chunk, on a throwaway state (`dsv41_model.warmKernels`, logged `[dsv41]
   kernels warmed ... in N ms`); after it nothing compiles but the streamed index top-k past 32k keys
   (`dsv41 kernels:` tests, `SUSHI_KERNEL_BUILD_LOG=1`).
+
+<a id="history-replay"></a>
+## Cross-request-history replay
+
+STQ-1.75bpw, M5 Max 128 GB, 2026-10-30: `83e68a08` over upstream `63d4ec0c`, ReleaseFast binary
+`64fa8264449c5f1d` built 05:12:13 UTC. Same-binary A = external history off; B = an empty writable private store,
+growing chronologically. Native adaptive DSpark stays on (`--mtp --no-drafter`); context 32768, output limit 4096,
+greedy, thinking off, prefill chunk 1024, SSD budget 96 GiB, RAM prefix cache 32 entries / 2 GiB, disk tier off.
+Each condition uses four independent boots in A B B A order, one canonical FIFO GPU lease per boot, `taskpolicy -a`,
+AC power and private settings/cache roots. No prior Sushi baseline exists for these recorded query sequences.
+
+These are **timing-unqualified observations**, not validated speedups: all 20 boots tripped the predeclared busy-GPU
+clock floor of 1100 MHz. Fans were automatic; recorded GPU temperature reached 100.8 °C. ABBA does not remove that
+qualification. Each decode rate is total native predicted tokens / total native decode seconds within a boot,
+then the two boot rates are averaged; client time includes the complete chronological HTTP sequence, not model loading.
+
+| Recorded workload | Decode off, tok/s | Decode on, tok/s | Client off, s | Client on, s |
+|---|---:|---:|---:|---:|
+| Code/tool edits | 50.65 | 51.50 | 49.35 | 48.28 |
+| Report edits | 52.28 | 52.34 | 52.31 | 52.24 |
+| Analysis edits | 52.21 | 51.68 | 55.46 | 55.73 |
+| Longer report | 44.07 | 44.64 | 113.97 | 112.78 |
+| Cross-project sequence | 50.56 | 49.08 | 103.06 | 104.70 |
+
+All 192 requests completed with DSpark, valid protocol/tool JSON and no output-limit truncation. Every quartet
+matched output token counts, finish reasons and generated content/tool arguments; generated tool IDs differed.
+History-off verified no history proposals; history-on verified 778 rounds, drafted 3884 tokens and accepted 3121.
+Every history-on boot's first request had zero history rounds. The first code/tool quartet's apparent gain is dominated
+by that history-free first request; following-turn decode was slightly lower with history. Reuse is exercised, but
+these workloads provide no convincing throughput benefit over native DSpark. This is fixed-request replay, not an
+autonomous coding-success evaluation. Cross-project warming also changes prefix/expert-cache state, not history alone.
+All owned servers were reaped before release; the shared GPU queue was free at the final check.

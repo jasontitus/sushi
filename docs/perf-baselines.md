@@ -423,3 +423,11 @@ fans max, 3 minutes idle before each server. One binary built from `a65539e1` (S
 fans max, 3 minutes idle before each server. One binary built from `4a1f1f1b` (SHA `b5cd630a`).
 - Qwen 2.6bpw, MiMo and GLM ran 5–20% under their v1.2.2 rows that day; the released v1.2.2 binary, rerun the same day
   on 2K–32K, measured the same, so compare v1.2.3 against those same-day reruns, not against the v1.2.2 report.
+
+## DeepSeek cross-request-history replay
+
+The [STQ-1.75bpw chronological-query ABBA replay](dsv41-arch.md#history-replay), 2026-10-30, records same-binary
+history-off/on observations on `83e68a08` (binary `64fa8264449c5f1d`, built 05:12:13 UTC), M5 Max 128 GB, AC,
+ReleaseFast, `taskpolicy -a`, a canonical FIFO GPU lease per boot and SSD budget 96 GiB. No matching earlier baseline
+exists. All boots failed the busy-clock timing gate with automatic fans: inherit the functional evidence, not a
+validated speedup or a release-ladder baseline.
